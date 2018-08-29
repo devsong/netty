@@ -27,6 +27,8 @@ import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.CharBuffer;
@@ -64,6 +66,7 @@ public final class ByteBufUtil {
     private static final int MAX_BYTES_PER_CHAR_UTF8 =
             (int) CharsetUtil.encoder(CharsetUtil.UTF_8).maxBytesPerChar();
 
+    static final int WRITE_CHUNK_SIZE = 8192;
     static final ByteBufAllocator DEFAULT_ALLOCATOR;
 
     static {
@@ -165,7 +168,7 @@ public final class ByteBufUtil {
         final int intCount = aLen >>> 2;
         final int byteCount = aLen & 3;
 
-        int hashCode = 1;
+        int hashCode = EmptyByteBuf.EMPTY_BYTE_BUF_HASH_CODE;
         int arrayIndex = buffer.readerIndex();
         if (buffer.order() == ByteOrder.BIG_ENDIAN) {
             for (int i = intCount; i > 0; i --) {
@@ -495,7 +498,10 @@ public final class ByteBufUtil {
      */
     public static int reserveAndWriteUtf8(ByteBuf buf, CharSequence seq, int reserveBytes) {
         for (;;) {
-            if (buf instanceof AbstractByteBuf) {
+            if (buf instanceof WrappedCompositeByteBuf) {
+                // WrappedCompositeByteBuf is a sub-class of AbstractByteBuf so it needs special handling.
+                buf = buf.unwrap();
+            } else if (buf instanceof AbstractByteBuf) {
                 AbstractByteBuf byteBuf = (AbstractByteBuf) buf;
                 byteBuf.ensureWritable0(reserveBytes);
                 int written = writeUtf8(byteBuf, byteBuf.writerIndex, seq, seq.length());
@@ -662,7 +668,10 @@ public final class ByteBufUtil {
             buf.writeBytes(asciiString.array(), asciiString.arrayOffset(), len);
         } else {
             for (;;) {
-                if (buf instanceof AbstractByteBuf) {
+                if (buf instanceof WrappedCompositeByteBuf) {
+                    // WrappedCompositeByteBuf is a sub-class of AbstractByteBuf so it needs special handling.
+                    buf = buf.unwrap();
+                } else if (buf instanceof AbstractByteBuf) {
                     AbstractByteBuf byteBuf = (AbstractByteBuf) buf;
                     byteBuf.ensureWritable0(len);
                     int written = writeAscii(byteBuf, byteBuf.writerIndex, seq, len);
@@ -1390,6 +1399,44 @@ public final class ByteBufUtil {
             }
         }
         return true;
+    }
+
+    /**
+     * Read bytes from the given {@link ByteBuffer} into the given {@link OutputStream} using the {@code position} and
+     * {@code length}. The position and limit of the given {@link ByteBuffer} may be adjusted.
+     */
+    static void readBytes(ByteBufAllocator allocator, ByteBuffer buffer, int position, int length, OutputStream out)
+            throws IOException {
+        if (buffer.hasArray()) {
+            out.write(buffer.array(), position + buffer.arrayOffset(), length);
+        } else {
+            int chunkLen = Math.min(length, WRITE_CHUNK_SIZE);
+            buffer.clear().position(position);
+
+            if (allocator.isDirectBufferPooled()) {
+                // if direct buffers are pooled chances are good that heap buffers are pooled as well.
+                ByteBuf tmpBuf = allocator.heapBuffer(chunkLen);
+                try {
+                    byte[] tmp = tmpBuf.array();
+                    int offset = tmpBuf.arrayOffset();
+                    getBytes(buffer, tmp, offset, chunkLen, out, length);
+                } finally {
+                    tmpBuf.release();
+                }
+            } else {
+                getBytes(buffer, new byte[chunkLen], 0, chunkLen, out, length);
+            }
+        }
+    }
+
+    private static void getBytes(ByteBuffer inBuffer, byte[] in, int inOffset, int inLen, OutputStream out, int outLen)
+            throws IOException {
+        do {
+            int len = Math.min(inLen, outLen);
+            inBuffer.get(in, inOffset, len);
+            out.write(in, inOffset, len);
+            outLen -= len;
+        } while (outLen > 0);
     }
 
     private ByteBufUtil() { }

@@ -61,7 +61,11 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     private final IntObjectMap<AbstractEpollChannel> channels = new IntObjectHashMap<AbstractEpollChannel>(4096);
     private final boolean allowGrowing;
     private final EpollEventArray events;
-    private final IovArray iovArray = new IovArray();
+
+    // These are initialized on first use
+    private IovArray iovArray;
+    private NativeDatagramPacketArray datagramPacketArray;
+
     private final SelectStrategy selectStrategy;
     private final IntSupplier selectNowSupplier = new IntSupplier() {
         @Override
@@ -69,14 +73,11 @@ final class EpollEventLoop extends SingleThreadEventLoop {
             return epollWaitNow();
         }
     };
-    private final Callable<Integer> pendingTasksCallable = new Callable<Integer>() {
-        @Override
-        public Integer call() throws Exception {
-            return EpollEventLoop.super.pendingTasks();
-        }
-    };
     private volatile int wakenUp;
     private volatile int ioRatio = 50;
+
+    // See http://man7.org/linux/man-pages/man2/timerfd_create.2.html.
+    private static final long MAX_SCHEDULED_TIMERFD_NS = 999999999;
 
     EpollEventLoop(EventLoopGroup parent, Executor executor, int maxEvents,
                    SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
@@ -138,9 +139,25 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     /**
      * Return a cleared {@link IovArray} that can be used for writes in this {@link EventLoop}.
      */
-    IovArray cleanArray() {
-        iovArray.clear();
+    IovArray cleanIovArray() {
+        if (iovArray == null) {
+            iovArray = new IovArray();
+        } else {
+            iovArray.clear();
+        }
         return iovArray;
+    }
+
+    /**
+     * Return a cleared {@link NativeDatagramPacketArray} that can be used for writes in this {@link EventLoop}.
+     */
+    NativeDatagramPacketArray cleanDatagramPacketArray() {
+        if (datagramPacketArray == null) {
+            datagramPacketArray = new NativeDatagramPacketArray();
+        } else {
+            datagramPacketArray.clear();
+        }
+        return datagramPacketArray;
     }
 
     @Override
@@ -192,17 +209,6 @@ final class EpollEventLoop extends SingleThreadEventLoop {
                                                     : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
     }
 
-    @Override
-    public int pendingTasks() {
-        // As we use a MpscQueue we need to ensure pendingTasks() is only executed from within the EventLoop as
-        // otherwise we may see unexpected behavior (as size() is only allowed to be called by a single consumer).
-        // See https://github.com/netty/netty/issues/5297
-        if (inEventLoop()) {
-            return super.pendingTasks();
-        } else {
-            return submit(pendingTasksCallable).syncUninterruptibly().getNow();
-        }
-    }
     /**
      * Returns the percentage of the desired amount of time spent for I/O in the event loop.
      */
@@ -233,7 +239,7 @@ final class EpollEventLoop extends SingleThreadEventLoop {
         long totalDelay = delayNanos(System.nanoTime());
         int delaySeconds = (int) min(totalDelay / 1000000000L, Integer.MAX_VALUE);
         return Native.epollWait(epollFd, events, timerFd, delaySeconds,
-                (int) min(totalDelay - delaySeconds * 1000000000L, Integer.MAX_VALUE));
+                (int) min(MAX_SCHEDULED_TIMERFD_NS, totalDelay - delaySeconds * 1000000000L));
     }
 
     private int epollWaitNow() throws IOException {
@@ -445,7 +451,14 @@ final class EpollEventLoop extends SingleThreadEventLoop {
             }
         } finally {
             // release native memory
-            iovArray.release();
+            if (iovArray != null) {
+                iovArray.release();
+                iovArray = null;
+            }
+            if (datagramPacketArray != null) {
+                datagramPacketArray.release();
+                datagramPacketArray = null;
+            }
             events.free();
         }
     }

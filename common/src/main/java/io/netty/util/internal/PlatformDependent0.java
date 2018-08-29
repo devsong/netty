@@ -368,7 +368,7 @@ final class PlatformDependent0 {
     }
 
     static boolean isExplicitNoUnsafe() {
-        return EXPLICIT_NO_UNSAFE_CAUSE == null;
+        return EXPLICIT_NO_UNSAFE_CAUSE != null;
     }
 
     private static Throwable explicitNoUnsafeCause0() {
@@ -427,7 +427,10 @@ final class PlatformDependent0 {
     }
 
     static ByteBuffer allocateDirectNoCleaner(int capacity) {
-        return newDirectBuffer(UNSAFE.allocateMemory(capacity), capacity);
+        // Calling malloc with capacity of 0 may return a null ptr or a memory address that can be used.
+        // Just use 1 to make it safe to use in all cases:
+        // See: http://pubs.opengroup.org/onlinepubs/009695399/functions/malloc.html
+        return newDirectBuffer(UNSAFE.allocateMemory(Math.max(1, capacity)), capacity);
     }
 
     static boolean hasAllocateArrayMethod() {
@@ -547,7 +550,16 @@ final class PlatformDependent0 {
     }
 
     static void copyMemory(long srcAddr, long dstAddr, long length) {
-        //UNSAFE.copyMemory(srcAddr, dstAddr, length);
+        // Manual safe-point polling is only needed prior Java9:
+        // See https://bugs.openjdk.java.net/browse/JDK-8149596
+        if (javaVersion() <= 8) {
+            copyMemoryWithSafePointPolling(srcAddr, dstAddr, length);
+        } else {
+            UNSAFE.copyMemory(srcAddr, dstAddr, length);
+        }
+    }
+
+    private static void copyMemoryWithSafePointPolling(long srcAddr, long dstAddr, long length) {
         while (length > 0) {
             long size = Math.min(length, UNSAFE_COPY_THRESHOLD);
             UNSAFE.copyMemory(srcAddr, dstAddr, size);
@@ -558,7 +570,17 @@ final class PlatformDependent0 {
     }
 
     static void copyMemory(Object src, long srcOffset, Object dst, long dstOffset, long length) {
-        //UNSAFE.copyMemory(src, srcOffset, dst, dstOffset, length);
+        // Manual safe-point polling is only needed prior Java9:
+        // See https://bugs.openjdk.java.net/browse/JDK-8149596
+        if (javaVersion() <= 8) {
+            copyMemoryWithSafePointPolling(src, srcOffset, dst, dstOffset, length);
+        } else {
+            UNSAFE.copyMemory(src, srcOffset, dst, dstOffset, length);
+        }
+    }
+
+    private static void copyMemoryWithSafePointPolling(
+            Object src, long srcOffset, Object dst, long dstOffset, long length) {
         while (length > 0) {
             long size = Math.min(length, UNSAFE_COPY_THRESHOLD);
             UNSAFE.copyMemory(src, srcOffset, dst, dstOffset, size);

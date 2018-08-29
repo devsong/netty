@@ -71,12 +71,6 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return selectNow();
         }
     };
-    private final Callable<Integer> pendingTasksCallable = new Callable<Integer>() {
-        @Override
-        public Integer call() throws Exception {
-            return NioEventLoop.super.pendingTasks();
-        }
-    };
 
     // Workaround for JDK NIO bug.
     //
@@ -179,8 +173,6 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return new SelectorTuple(unwrappedSelector);
         }
 
-        final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
-
         Object maybeSelectorImplClass = AccessController.doPrivileged(new PrivilegedAction<Object>() {
             @Override
             public Object run() {
@@ -206,6 +198,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
 
         final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
+        final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
 
         Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
             @Override
@@ -258,18 +251,6 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         // This event loop never calls takeTask()
         return maxPendingTasks == Integer.MAX_VALUE ? PlatformDependent.<Runnable>newMpscQueue()
                                                     : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
-    }
-
-    @Override
-    public int pendingTasks() {
-        // As we use a MpscQueue we need to ensure pendingTasks() is only executed from within the EventLoop as
-        // otherwise we may see unexpected behavior (as size() is only allowed to be called by a single consumer).
-        // See https://github.com/netty/netty/issues/5297
-        if (inEventLoop()) {
-            return super.pendingTasks();
-        } else {
-            return submit(pendingTasksCallable).syncUninterruptibly().getNow();
-        }
     }
 
     /**
@@ -395,7 +376,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             }
         }
 
-        logger.info("Migrated " + nChannels + " channel(s) to the new Selector.");
+        if (logger.isInfoEnabled()) {
+            logger.info("Migrated " + nChannels + " channel(s) to the new Selector.");
+        }
     }
 
     @Override
@@ -730,6 +713,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             int selectCnt = 0;
             long currentTimeNanos = System.nanoTime();
             long selectDeadLineNanos = currentTimeNanos + delayNanos(currentTimeNanos);
+
             for (;;) {
                 long timeoutMillis = (selectDeadLineNanos - currentTimeNanos + 500000L) / 1000000L;
                 if (timeoutMillis <= 0) {

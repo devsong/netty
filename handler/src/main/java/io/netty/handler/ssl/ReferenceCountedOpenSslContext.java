@@ -49,11 +49,11 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
@@ -265,7 +265,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             List<String> nextProtoList = apn.protocols();
                 /* Set next protocols for next protocol negotiation extension, if specified */
             if (!nextProtoList.isEmpty()) {
-                String[] appProtocols = nextProtoList.toArray(new String[nextProtoList.size()]);
+                String[] appProtocols = nextProtoList.toArray(new String[0]);
                 int selectorBehavior = opensslSelectorFailureBehavior(apn.selectorFailureBehavior());
 
                 switch (apn.protocol()) {
@@ -285,26 +285,20 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             }
 
             /* Set session cache size, if specified */
-            if (sessionCacheSize > 0) {
-                this.sessionCacheSize = sessionCacheSize;
-                SSLContext.setSessionCacheSize(ctx, sessionCacheSize);
-            } else {
+            if (sessionCacheSize <= 0) {
                 // Get the default session cache size using SSLContext.setSessionCacheSize()
-                this.sessionCacheSize = sessionCacheSize = SSLContext.setSessionCacheSize(ctx, 20480);
-                // Revert the session cache size to the default value.
-                SSLContext.setSessionCacheSize(ctx, sessionCacheSize);
+                sessionCacheSize = SSLContext.setSessionCacheSize(ctx, 20480);
             }
+            this.sessionCacheSize = sessionCacheSize;
+            SSLContext.setSessionCacheSize(ctx, sessionCacheSize);
 
             /* Set session timeout, if specified */
-            if (sessionTimeout > 0) {
-                this.sessionTimeout = sessionTimeout;
-                SSLContext.setSessionCacheTimeout(ctx, sessionTimeout);
-            } else {
+            if (sessionTimeout <= 0) {
                 // Get the default session timeout using SSLContext.setSessionCacheTimeout()
-                this.sessionTimeout = sessionTimeout = SSLContext.setSessionCacheTimeout(ctx, 300);
-                // Revert the session timeout to the default value.
-                SSLContext.setSessionCacheTimeout(ctx, sessionTimeout);
+                sessionTimeout = SSLContext.setSessionCacheTimeout(ctx, 300);
             }
+            this.sessionTimeout = sessionTimeout;
+            SSLContext.setSessionCacheTimeout(ctx, sessionTimeout);
 
             if (enableOcsp) {
                 SSLContext.enableOcsp(ctx, isClient());
@@ -492,6 +486,11 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
 
                 SSLContext.free(ctx);
                 ctx = 0;
+
+                OpenSslSessionContext context = sessionContext();
+                if (context != null) {
+                    context.destroy();
+                }
             }
         } finally {
             writerLock.unlock();
@@ -570,10 +569,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
 
     static boolean useExtendedTrustManager(X509TrustManager trustManager) {
         return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
-    }
-
-    static boolean useExtendedKeyManager(X509KeyManager keyManager) {
-        return PlatformDependent.javaVersion() >= 7 && keyManager instanceof X509ExtendedKeyManager;
     }
 
     @Override
@@ -716,7 +711,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             keyCertChainBio2 = toBIO(ByteBufAllocator.DEFAULT, encoded.retain());
 
             if (key != null) {
-                keyBio = toBIO(key);
+                keyBio = toBIO(ByteBufAllocator.DEFAULT, key);
             }
 
             SSLContext.setCertificateBio(
@@ -748,12 +743,11 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
      * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
      * or {@code 0} if the {@code key} is {@code null}. The BIO contains the content of the {@code key}.
      */
-    static long toBIO(PrivateKey key) throws Exception {
+    static long toBIO(ByteBufAllocator allocator, PrivateKey key) throws Exception {
         if (key == null) {
             return 0;
         }
 
-        ByteBufAllocator allocator = ByteBufAllocator.DEFAULT;
         PemEncoded pem = PemPrivateKey.toPEM(allocator, true, key);
         try {
             return toBIO(allocator, pem.retain());
@@ -766,7 +760,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
      * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
      * or {@code 0} if the {@code certChain} is {@code null}. The BIO contains the content of the {@code certChain}.
      */
-    static long toBIO(X509Certificate... certChain) throws Exception {
+    static long toBIO(ByteBufAllocator allocator, X509Certificate... certChain) throws Exception {
         if (certChain == null) {
             return 0;
         }
@@ -775,7 +769,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             throw new IllegalArgumentException("certChain can't be empty");
         }
 
-        ByteBufAllocator allocator = ByteBufAllocator.DEFAULT;
         PemEncoded pem = PemX509Certificate.toPEM(allocator, true, certChain);
         try {
             return toBIO(allocator, pem.retain());
@@ -826,5 +819,24 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         } finally {
             buffer.release();
         }
+    }
+
+    /**
+     * Returns the {@link OpenSslKeyMaterialProvider} that should be used for OpenSSL. Depending on the given
+     * {@link KeyManagerFactory} this may cache the {@link OpenSslKeyMaterial} for better performance if it can
+     * ensure that the same material is always returned for the same alias.
+     */
+    static OpenSslKeyMaterialProvider providerFor(KeyManagerFactory factory, String password) {
+        if (factory instanceof OpenSslX509KeyManagerFactory) {
+            return ((OpenSslX509KeyManagerFactory) factory).newProvider();
+        }
+
+        X509KeyManager keyManager = chooseX509KeyManager(factory.getKeyManagers());
+        if (factory instanceof OpenSslCachingX509KeyManagerFactory) {
+            // The user explicit used OpenSslCachingX509KeyManagerFactory which signals us that its fine to cache.
+            return new OpenSslCachingKeyMaterialProvider(keyManager, password);
+        }
+        // We can not be sure if the material may change at runtime so we will not cache it.
+        return new OpenSslKeyMaterialProvider(keyManager, password);
     }
 }
